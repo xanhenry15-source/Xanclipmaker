@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Auto Clip Maker v3</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#111;color:#eee;max-width:600px;margin:auto;padding:16px}
+label{display:block;margin:10px 0 4px;font-size:14px;color:#aaa}
+input,select,button{width:100%;padding:12px;border-radius:8px;border:0;font-size:16px;box-sizing:border-box}
+input,select{background:#222;color:#eee}
+button{background:#7c3aed;color:#fff;margin-top:10px;font-weight:600}
+button:disabled{opacity:.5}
+.clip{background:#1d1d1d;border-radius:10px;padding:12px;margin-top:10px}
+.row{display:flex;gap:8px}
+#msg{margin:12px 0;color:#a3e635;min-height:20px}
+video{width:100%;margin-top:10px;border-radius:8px}
+</style>
+</head>
+<body>
+<h2>🎬 Auto Clip Maker v3</h2>
+<input type="file" id="fileIn" accept="video/*">
+
+<label>Clip length</label>
+<select id="lenSel"><option value="15">15 sec</option><option value="30" selected>30 sec</option><option value="45">45 sec</option><option value="60">60 sec</option></select>
+
+<label>Number of clips</label>
+<select id="numSel"><option>3</option><option selected>5</option><option>8</option></select>
+
+<label>Layout</label>
+<select id="layoutSel"><option value="blur">Blurred background (pro look)</option><option value="fit">Fit (black bars)</option><option value="fill">Fill (crop sides)</option></select>
+
+<label>Caption style</label>
+<select id="styleSel"><option value="yellow">Yellow pop</option><option value="highlight">Purple highlight box</option><option value="plain">White outline</option></select>
+
+<label>Auto subtitles (only works if someone speaks in the video)</label>
+<select id="autoSel"><option value="off">Off</option><option value="on">On (slower, downloads ~40 MB once)</option></select>
+
+<label>Hook title at top (optional)</label>
+<input id="capIn" placeholder="e.g. Wait for the crocodile... 🐊">
+
+<button id="goBtn" type="button">Find best moments</button>
+<div id="msg">Loading...</div>
+<video id="vid" playsinline controls></video>
+<div id="clipList"></div>
+<canvas id="cv" style="display:none"></canvas>
+
+<script>
+(function(){
+var g=function(id){return document.getElementById(id)};
+var msg=g('msg');
+function say(t){msg.textContent=t}
+window.addEventListener('error',function(e){say('Error: '+e.message)});
+window.addEventListener('unhandledrejection',function(e){say('Error: '+(e.reason&&e.reason.message||e.reason))});
+
+var W=540,H=960,SW=36,SH=64;
+var vid=g('vid'),cv=g('cv'),ctx=cv.getContext('2d');
+cv.width=W;cv.height=H;
+var sm=document.createElement('canvas');sm.width=SW;sm.height=SH;
+var sctx=sm.getContext('2d');
+var file=null,fileUrl=null,ac=null,srcNode=null,dest=null,spk=null;
+var pcm16=null,asr=null;
+var capChunks=[],hookImg=null,layout='blur',capStyle='yellow';
+
+function fmt(s){return Math.floor(s/60)+':'+String(Math.floor(s%60)).padStart(2,'0')}
+function sleep(ms){return new Promise(function(r){setTimeout(r,ms)})}
+function rr(x,px,py,w,h,r){x.beginPath();if(x.roundRect)x.roundRect(px,py,w,h,r);else x.rect(px,py,w,h)}
+
+g('fileIn').addEventListener('change',function(e){
+  file=e.target.files[0];if(!file)return;
+  if(fileUrl)URL.revokeObjectURL(fileUrl);
+  fileUrl=URL.createObjectURL(file);vid.src=fileUrl;
+  pcm16=null;g('clipList').innerHTML='';
+  say('Video loaded ('+Math.round(file.size/1048576)+' MB). Tap "Find best moments".');
+});
+
+function initAudio(){
+  if(ac)return;
+  ac=new (window.AudioContext||window.webkitAudioContext)();
+  srcNode=ac.createMediaElementSource(vid);
+  dest=ac.createMediaStreamDestination();
+  spk=ac.createGain();
+  srcNode.connect(spk);spk.connect(ac.destination);
+  srcNode.connect(dest);
+}
+
+function waitMeta(){
+  return new Promise(function(r){
+    if(vid.readyState>=1&&isFinite(vid.duration))return r();
+    vid.onloadedmetadata=function(){r()};
+    setTimeout(r,5000);
+  });
+}
+
+async function analyze(len,num){
+  var tmp=new (window.AudioContext||window.webkitAudioContext)();
+  var buf=await file.arrayBuffer();
+  var audio=await Promise.race([
+    tmp.decodeAudioData(buf),
+    new Promise(function(_,rej){setTimeout(function(){rej(new Error('audio analysis timed out'))},30000)})
+  ]);
+  var d=audio.getChannelData(0),sr=audio.sampleRate;
+  var win=Math.floor(sr*0.5),n=Math.floor(d.length/win),en=[];
+  for(var i=0;i<n;i++){
+    var s=0,k=0;
+    for(var j=i*win;j<(i+1)*win;j+=8){s+=d[j]*d[j];k++}
+    en.push(Math.sqrt(s/k));
+  }
+  var sm2=[];
+  for(var a=0;a<n;a++){
+    var s2=0,k2=0;
+    for(var b=Math.max(0,a-5);b<=Math.min(n-1,a+5);b++){s2+=en[b];k2++}
+    sm2.push({t:a*0.5,score:s2/k2});
+  }
+  sm2.sort(function(x,y){return y.score-x.score});
+  var mx=sm2.length?sm2[0].score:1;
+  var picked=[];
+  for(var q=0;q<sm2.length;q++){
+    if(picked.length>=num)break;
+    var p=sm2[q];
+    if(picked.every(function(z){return Math.abs(z.t-p.t)>=len}))picked.push(p);
+  }
+  tmp.close();
+  return picked.map(function(p){return {s:Math.max(0,p.t-8),score:Math.round(p.score/mx*100)}});
+}
+
+g('goBtn').addEventListener('click',async function(){
+  say('Working...');
+  if(!file){say('Pick a video first.');return}
+  var len=+g('lenSel').value,num=+g('numSel').value;
+  var btn=g('goBtn');btn.disabled=true;g('clipList').innerHTML='';
+  try{
+    await waitMeta();
+    var items=[];
+    try{
+      say('Analyzing audio for loud moments (can take a minute)...');
+      items=await analyze(len,num);
+    }catch(err){
+      say('Audio analysis failed ('+err.message+'). Using evenly spaced clips.');
+      var dur=vid.duration||len*num;
+      for(var i=0;i<num;i++)items.push({s:(dur/(num+1))*(i+1),score:null});
+    }
+    items.sort(function(x,y){return x.s-y.s});
+    items.forEach(function(it,i){
+      var s=it.s,end=Math.min(vid.duration||s+len,s+len);
+      var div=document.createElement('div');
+      div.className='clip';
+      div.innerHTML='<b>Clip '+(i+1)+'</b> — '+fmt(s)+' to '+fmt(end)+
+        ' &nbsp; 🔥 Hype '+(it.score==null?'–':it.score)+
+        '<div class="row"><button type="button" class="pv">Preview</button><button type="button" class="ex">Export vertical</button></div>';
+      div.querySelector('.pv').onclick=function(){vid.currentTime=s;vid.play();vid.scrollIntoView({behavior:'smooth'})};
+      div.querySelector('.ex').onclick=function(){exportClip(s,end,i+1)};
+      g('clipList').appendChild(div);
+    });
+    if(items.length)say('Found '+items.length+' moments. Preview, then export.');
+  }catch(err){
+    say('Error: '+err.message);
+  }finally{
+    btn.disabled=false;
+  }
+});
+
+/* ---------- Auto subtitles (Whisper in the browser) ---------- */
+async function getAsr(){
+  if(asr)return asr;
+  say('Loading caption AI (first time downloads ~40 MB)...');
+  var mod=await import('https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2');
+  mod.env.allowLocalModels=false;
+  asr=await mod.pipeline('automatic-speech-recognition','Xenova/whisper-tiny.en');
+  return asr;
+}
+async function transcribe(s,e){
+  if(!pcm16){
+    say('Preparing audio for captions...');
+    var c16=new (window.AudioContext||window.webkitAudioContext)({sampleRate:16000});
+    var audio=await c16.decodeAudioData(await file.arrayBuffer());
+    pcm16=audio.getChannelData(0);
+    c16.close();
+  }
+  var data=pcm16.slice(Math.floor(s*16000),Math.floor(e*16000));
+  var pipe=await getAsr();
+  say('Writing subtitles... this can take about a minute. Keep this screen open.');
+  await sleep(50);
+  var out=await pipe(data,{return_timestamps:'word',chunk_length_s:30});
+  return (out.chunks||[]).map(function(c){
+    var st=c.timestamp[0],en=c.timestamp[1];
+    return {text:c.text.trim().replace(/[,.!?]+$/,''),start:st,end:(en==null?st+0.4:en)};
+  }).filter(function(w){return w.text});
+}
+function makeChunks(ws){
+  var out=[],cur=[];
+  function push(){if(cur.length){out.push({words:cur,start:cur[0].start,end:cur[cur.length-1].end});cur=[]}}
+  ws.forEach(function(w){
+    if(cur.length&&(cur.length>=3||w.start-cur[cur.length-1].end>0.7))push();
+    cur.push(w);
+  });
+  push();
+  return out;
+}
+
+/* ---------- Drawing ---------- */
+function makeHook(text){
+  if(!text)return null;
+  var c=document.createElement('canvas');c.width=W;c.height=260;
+  var x=c.getContext('2d');
+  x.font='bold 46px system-ui,sans-serif';x.textAlign='center';x.textBaseline='middle';
+  var words=text.split(' '),lines=[],cur='';
+  words.forEach(function(w){
+    var t=cur?cur+' '+w:w;
+    if(x.measureText(t).width>W-110&&cur){lines.push(cur);cur=w}else cur=t;
+  });
+  lines.push(cur);lines=lines.slice(0,3);
+  var lh=58,bh=lines.length*lh+36,bw=0;
+  lines.forEach(function(l){bw=Math.max(bw,x.measureText(l).width)});
+  bw+=60;
+  x.fillStyle='rgba(0,0,0,.72)';rr(x,(W-bw)/2,0,bw,bh,24);x.fill();
+  x.fillStyle='#fff';
+  lines.forEach(function(l,i){x.fillText(l,W/2,18+lh/2+i*lh)});
+  return c;
+}
+
+function drawChunk(t){
+  var ch=null,i;
+  for(i=0;i<capChunks.length;i++){
+    if(t>=capChunks[i].start-0.05&&t<=capChunks[i].end+0.25){ch=capChunks[i];break}
+  }
+  if(!ch)return;
+  var fs=60,fsz=60,ws=ch.words.map(function(w){return w.text.toUpperCase()}),widths,total,sp;
+  do{
+    ctx.font='bold '+fs+'px system-ui,sans-serif';
+    fsz=fs;
+    sp=ctx.measureText(' ').width+4;
+    widths=ws.map(function(w){return ctx.measureText(w).width});
+    total=widths.reduce(function(a,b){return a+b},0)+sp*(ws.length-1);
+    fs-=4;
+  }while(total>W-50&&fs>24);
+  var x=(W-total)/2,y=H*0.7;
+  ctx.textAlign='left';ctx.textBaseline='middle';ctx.lineJoin='round';
+  for(i=0;i<ws.length;i++){
+    var wd=ch.words[i],nx=ch.words[i+1];
+    var active=t>=wd.start&&(!nx||t<nx.start);
+    var w=widths[i];
+    if(capStyle==='highlight'&&active){
+      ctx.fillStyle='#7c3aed';rr(ctx,x-12,y-fsz*0.7,w+24,fsz*1.4,14);ctx.fill();
+    }
+    if(!(capStyle==='highlight'&&active)){
+      ctx.lineWidth=Math.max(6,fsz/6);ctx.strokeStyle='#000';ctx.strokeText(ws[i],x,y);
+    }
+    ctx.fillStyle=(capStyle==='yellow'&&active)?'#ffe600':'#fff';
+    ctx.fillText(ws[i],x,y);
+    x+=w+sp;
+  }
+}
+
+function frame(t){
+  var vw=vid.videoWidth,vh=vid.videoHeight,sc,w,h;
+  if(!vw||!vh)return;
+  if(layout==='blur'){
+    sc=Math.max(SW/vw,SH/vh);w=vw*sc;h=vh*sc;
+    sctx.drawImage(vid,(SW-w)/2,(SH-h)/2,w,h);
+    ctx.drawImage(sm,0,0,W,H);
+    ctx.fillStyle='rgba(0,0,0,.4)';ctx.fillRect(0,0,W,H);
+    sc=W/vw;h=vh*sc;ctx.drawImage(vid,0,(H-h)/2,W,h);
+  }else if(layout==='fill'){
+    sc=Math.max(W/vw,H/vh);w=vw*sc;h=vh*sc;
+    ctx.drawImage(vid,(W-w)/2,(H-h)/2,w,h);
+  }else{
+    ctx.fillStyle='#000';ctx.fillRect(0,0,W,H);
+    sc=W/vw;h=vh*sc;ctx.drawImage(vid,0,(H-h)/2,W,h);
+  }
+  if(hookImg&&t<3.5)ctx.drawImage(hookImg,0,70);
+  if(capChunks.length)drawChunk(t);
+}
+
+/* ---------- Export ---------- */
+async function exportClip(s,e,num){
+  var all=document.querySelectorAll('button');
+  all.forEach(function(b){b.disabled=true});
+  try{
+    layout=g('layoutSel').value;capStyle=g('styleSel').value;
+    hookImg=makeHook(g('capIn').value.trim());
+    capChunks=[];
+    if(g('autoSel').value==='on'){
+      try{
+        var ws=await transcribe(s,e);
+        capChunks=makeChunks(ws);
+        if(!capChunks.length){say('No speech found, exporting without subtitles.');await sleep(1500)}
+      }catch(err){
+        say('Subtitles failed ('+err.message+'). Exporting without them.');await sleep(2500);
+      }
+    }
+    initAudio();await ac.resume();spk.gain.value=0;
+    vid.pause();vid.currentTime=s;
+    await new Promise(function(r){vid.onseeked=r});
+    frame(0);
+    var stream=cv.captureStream(30);
+    dest.stream.getAudioTracks().forEach(function(t){stream.addTrack(t)});
+    var mimes=['video/mp4','video/webm;codecs=vp9,opus','video/webm'],mime='';
+    for(var m=0;m<mimes.length;m++){if(window.MediaRecorder&&MediaRecorder.isTypeSupported(mimes[m])){mime=mimes[m];break}}
+    var opts={videoBitsPerSecond:3500000,audioBitsPerSecond:128000};
+    if(mime)opts.mimeType=mime;
+    var rec=new MediaRecorder(stream,opts);
+    var parts=[];
+    rec.ondataavailable=function(ev){if(ev.data.size)parts.push(ev.data)};
+    var done=new Promise(function(r){rec.onstop=r});
+    rec.start();
+    await vid.play();
+    await new Promise(function(res){
+      var last=0,finished=false;
+      function finish(){if(!finished){finished=true;res()}}
+      setTimeout(finish,((e-s)+10)*1000);
+      function next(){
+        if(vid.requestVideoFrameCallback)vid.requestVideoFrameCallback(step);
+        else requestAnimationFrame(step);
+      }
+      function step(){
+        if(finished)return;
+        frame(vid.currentTime-s);
+        var now=Date.now();
+        if(now-last>1000){last=now;say('Recording clip '+num+': '+Math.round(vid.currentTime-s)+'s / '+Math.round(e-s)+'s (keep this screen open)')}
+        if(vid.currentTime>=e||vid.ended){finish();return}
+        next();
+      }
+      next();
+    });
+    vid.pause();rec.stop();await done;
+    spk.gain.value=1;
+    var blob=new Blob(parts,{type:mime||'video/webm'});
+    var a=document.createElement('a');
+    a.href=URL.createObjectURL(blob);
+    a.download='clip'+num+(mime.indexOf('mp4')>-1?'.mp4':'.webm');
+    a.click();
+    say('Clip '+num+' saved. Check your downloads.');
+  }catch(err){
+    say('Export error: '+err.message);
+  }finally{
+    all.forEach(function(b){b.disabled=false});
+  }
+}
+
+say('Ready ✓ v3 - pick a video');
+})();
+</script>
+</body>
+</html>
